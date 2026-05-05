@@ -150,6 +150,8 @@ typedef struct
 
 	
 	
+/** Hashing loops through the characters in the string shifting by 2^5 and multiplying by 33. This is done because it is fast and helps avoid collision by scattering the key.
+*/
 unsigned int hashing(const char *key, int numGroups)
 {
 		unsigned int hashNum = 5381;
@@ -160,7 +162,7 @@ unsigned int hashing(const char *key, int numGroups)
 		}
 		return hashNum % numGroups;
 }
-	/** Cleanup process for the memory. Loops trhough each group andwalks down the linked list. Every group thrown away has the pointer save to the next box. Itr then unties the groups, frees it and moves on. Once all boxes are gone then the free function can be used on the group and eventually the structure of the table as well.
+	/** Cleanup process for the memory. Tears down the linked lists first checking to see if a null pointer passes in. Then loops every buckket in the hash table. Grabs head of the bucket, then walks down linked list through the while loop to free all nodes. Saves the current node adress to the next node to maintain the linking
 	
 	*/
 void freeTable(table_t *table)
@@ -185,6 +187,8 @@ void freeTable(table_t *table)
 	free(table);
 }
 
+/** Intialization of queue to prevent overloading the memory. Setting up the bounded circular buffer. Initialization for vairables and setting up the locks. 
+*/
 void initializeQue(int numWorkers)
 {
 	queue.capacity = numWorkers * 2;
@@ -206,6 +210,7 @@ void enque(int conn_fd)
 	//Checks to see if the queue is at max capacity and if it is all threads sleep until queue is not longer full
 	while(queue.count == queue.capacity)
 	{
+	//Sleeps main thread and unlocks the mutex so worker thread can clear the queue.
 		pthread_cond_wait(&queue.not_full, &queue.lock);
 	}
 	
@@ -242,7 +247,8 @@ int deque()
 	
 	return conn_fd;
 }
-
+/**Put)key adds new data into nodes but walks trhough the bucket first and tries to find if the key already exists to update it
+*/
 void put_key(const char *key, const char *val, int ttl) 
 {
 	unsigned int idx = hashing(key, global_table->numGroups);
@@ -250,6 +256,7 @@ void put_key(const char *key, const char *val, int ttl)
 	
     node_t *current = global_table->groups[idx];
 
+//Walks through to find a key match
     while (current != NULL) 
     {
         if (strcmp(current->key, key) == 0) 
@@ -262,25 +269,30 @@ void put_key(const char *key, const char *val, int ttl)
         current = current->next;
     }
 
+//Creates new node and copies the key + values to the spot and sets the TTl
     node_t *newNode = malloc(sizeof(node_t));
     strcpy(newNode->key, key);
     strcpy(newNode->value, val);
     newNode->expires_at = (ttl > 0) ? time(NULL) + ttl : 0;
     newNode->next = global_table->groups[idx];
     global_table->groups[idx] = newNode;
-    
+    //Locks the stats to update STATS
     pthread_mutex_lock(&global_stats.lock);
     global_stats.keys++;
     pthread_mutex_unlock(&global_stats.lock);
+    //Unlcok hash bucket for other threads to use
     pthread_rwlock_unlock(&global_table->rwlocks[idx]);
 }
 
+/**Looks at the data and only wants readlock allowing all threads to access the same bucket if they want.
+*/
 int get_key(const char *key, char *val_out) 
 {
 	    unsigned int idx = hashing(key, global_table->numGroups);
 	pthread_rwlock_rdlock(&global_table->rwlocks[idx]);
     node_t *current = global_table->groups[idx];
 
+//Similar to get_key searches the linked list first and if finds something copies the data to val_out
     while (current != NULL) 
     {
         if (strcmp(current->key, key) == 0) 
@@ -291,10 +303,13 @@ int get_key(const char *key, char *val_out)
         }
         current = current->next;
     }
+    //If not found unlock and return not found
     pthread_rwlock_unlock(&global_table->rwlocks[idx]);
     return 0;
 }
 
+/**Rremoves the node completely. Requests write lock to modify the linked list
+*/
 int del_key(const char *key) 
 {
 	    unsigned int idx = hashing(key, global_table->numGroups);
@@ -302,6 +317,7 @@ int del_key(const char *key)
     node_t *current = global_table->groups[idx];
     node_t *prev = NULL;
 
+//2 pointers walk down the linked list and when the node it wants to delete is found it detaches and links the 2 nodes that lost its partner together.
     while (current != NULL) 
     {
         if (strcmp(current->key, key) == 0) 
@@ -315,6 +331,8 @@ int del_key(const char *key)
             {
                 prev->next = current->next;
             }
+            //Has to free the current node after unlinking and then updates thae stats again
+            
             free(current);
                 pthread_mutex_lock(&global_stats.lock);
     		global_stats.keys--;
@@ -328,7 +346,8 @@ int del_key(const char *key)
     pthread_rwlock_unlock(&global_table->rwlocks[idx]);
     return 0;
 }
-     
+/**Garbage collector
+*/
 void *sweeper_loop(void *arg)
 {
 
@@ -339,18 +358,21 @@ void *sweeper_loop(void *arg)
 		if(g_shutdown)break;
 		
 		time_t now = time(NULL);
-		
+		//Checks every bucket
 		for(int e = 0; e < global_table->numGroups; e++)
 		{
+		//Cleans only e so other threads can still use all the 0ther 1023 buckets. and walks linked list
 			pthread_rwlock_wrlock(&global_table->rwlocks[e]);
 			node_t *curr = global_table->groups[e];
 			node_t *prev = NULL;
 	
 			while(curr != NULL)
 			{
+			//checks if ttl exicts and if it is expired
 				if(curr->expires_at > 0 && curr->expires_at <= now)
 				{
 					node_t *temp = curr;
+					//node head checking logic and unlinking logic
 					if(prev == NULL)
 					{
 						global_table->groups[e] = curr->next;
@@ -366,12 +388,14 @@ void *sweeper_loop(void *arg)
 					global_stats.keys--;
 					pthread_mutex_unlock(&global_stats.lock);
 				}
+				//Valid node = moving the pointers forward for next nodes then continues
 			else
 			{
 				prev = curr;
 				curr = curr->next;
 			}
 	}
+	//at the end of the linked list, bucket opens up and goes to get the next bucket
 	pthread_rwlock_unlock(&global_table->rwlocks[e]);
 	}
 	}
@@ -409,7 +433,7 @@ void commandHandler(int conn_fd)
      	
      	if(parsed > 0)
      	{
-     	
+     	//Checks for command and if there are the proper argument numvers. Calls respective keys, updates stats and prints responses.
      		if(strcmp(cmd, "QUIT") == 0)
      		{
      			dprintf(conn_fd, "BYE\n");
@@ -575,7 +599,7 @@ int main(int argc, char **argv) {
      return 0;
      */
      
-     
+     //for worker threads, intialization of them, allocation of memory and looping to get the requested thread amount + a sweeper loop thread for background work
      initializeQue(num_workers);
      workers = malloc(sizeof(pthread_t) * num_workers);
      for(int c = 0; c < num_workers; c++)
@@ -599,7 +623,7 @@ int main(int argc, char **argv) {
 	}
 	enque(conn);
 	}
-	
+	//Gathers the threads after tasks are finished and destroys everything including memory and locks. Frees everything and ends the server
 	pthread_mutex_lock(&queue.lock);
 	pthread_cond_broadcast(&queue.not_empty);
 	pthread_mutex_unlock(&queue.lock);
@@ -614,6 +638,7 @@ int main(int argc, char **argv) {
 	free(workers);
 	free(queue.fds);
 	freeTable(global_table);
+	//Stops mem leaks
 	close(listen_fd);
 	return 0;
 }

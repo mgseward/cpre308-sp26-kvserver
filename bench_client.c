@@ -25,15 +25,108 @@
  *     per command.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <pthread.h>
+#include <time.h>
+
+typedef struct{
+	const char *host;
+	int port;
+	int ops_per_client;
+	int read_pct;
+	int thread;
+}
+thread_args_t;
 
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s <host> <port> <num_clients> <ops_per_client> <read_pct>\n",
         prog);
 }
+
+void *run_client(void *arg)
+{
+	thread_args_t *args = (thread_args_t *)arg;
+	unsigned int seed = (unsigned int)(time(NULL) ^ (args->thread << 16));
+	
+	int socketPort = socket(AF_INET, SOCK_STREAM, 0);
+	if(socketPort < 0)
+	{
+		perror("socket");
+		return NULL;
+	}
+	
+	struct hostent *server = gethostbyname(args->host);
+	if(server == NULL)
+	{
+		fprintf(stderr, "error: no such host %s\n", args->host);
+		close(socketPort);
+		return NULL;
+	}
+	
+	struct sockaddr_in serv_addr;
+	memset(&serv_addr, 0, sizeof(serv_addr));
+	serv_addr.sin_family = AF_INET;
+	memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+	serv_addr.sin_port = htons(args->port);
+	
+	if(connect(socketPort, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+	{
+		perror("connect");
+		close(socketPort);
+		return NULL;
+	}
+	
+	FILE *stream = fdopen(socketPort, "r+");
+	if(!stream)
+	{
+		close(socketPort);
+		return NULL;
+	}
+	char *line = NULL;
+	size_t len = 0;
+	for(int a = 0; a < args->ops_per_client; a++)
+	{
+		int key = rand_r(&seed) % 1000;
+		if((rand_r(&seed) % 100) < args->read_pct)
+		{
+			fprintf(stream, "GET key%d\n", key);
+		}
+		else
+		{
+			fprintf(stream, "PUT key%d val%d 0\n", key, a);
+		}
+		fflush(stream);
+		
+		if(getline(&line, &len, stream) == -1)
+		{
+			break;
+		}
+		
+	}
+	
+	fprintf(stream, "QUIT\n");
+	fflush(stream);
+	if(getline(&line, &len, stream) != -1)
+	{
+	/**
+	*/
+	}
+	
+	free(line);
+	fclose(stream);
+	return NULL;
+}
+	
+	
 
 int main(int argc, char **argv) {
     if (argc != 6) {
@@ -53,7 +146,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    (void)host;  /* silence warnings until you implement */
+    //(void)host;  /* silence warnings until you implement */
 
     /* TODO:
      *   1. Spawn num_clients pthreads.
@@ -62,7 +155,43 @@ int main(int argc, char **argv) {
      *   3. Join all threads.
      *   4. Compute and print total elapsed time and total ops/sec.
      */
+     
+     pthread_t *threads = malloc(sizeof(pthread_t) * num_clients);
+     thread_args_t *t_args = malloc(sizeof(thread_args_t) * num_clients);
+     
+     struct timespec start;
+     struct timespec end;
+     clock_gettime(CLOCK_MONOTONIC, &start);
+     
+     for(int b = 0; b < num_clients; b++)
+     {
+     	t_args[b].host = host;
+     	t_args[b].port = port;
+     	t_args[b].ops_per_client = ops_per_client;
+     	t_args[b].read_pct = read_pct;
+     	t_args[b].thread = b;
+     	pthread_create(&threads[b], NULL, run_client, &t_args[b]);
+     	
+     }
+     for(int c = 0; c < num_clients; c++)
+     {
+     	pthread_join(threads[c], NULL);
+     }
+     clock_gettime(CLOCK_MONOTONIC, &end);
+     
+     double elapsed = (end.tv_sec - start.tv_sec)+(end.tv_nsec - start.tv_nsec) / 1000000000.0;
+     long total_ops = (long)num_clients * ops_per_client;
+     
+     printf("Benchmark results:\n");
+     printf("Total elapsed time: 	%.5f secpmds\n", elapsed);
+     printf("Total operations 	%ld\n", total_ops);
+     printf("Throuhgput:	%.2f ops/sec\n", total_ops/elapsed);
+     
+     free(threads);
+     free(t_args);
+     return 0;
+  	
 
-    fprintf(stderr, "bench_client: not implemented yet\n");
-    return 0;
+   // fprintf(stderr, "bench_client: not implemented yet\n");
+    //return 0;
 }
